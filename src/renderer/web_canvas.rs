@@ -61,12 +61,49 @@ fn group_label_matches_replay_plane(
         None => true,
     }
 }
+
+fn is_kopub_dotum_light_face(font_family: &str) -> bool {
+    let primary = font_family
+        .split(',')
+        .next()
+        .unwrap_or(font_family)
+        .trim()
+        .trim_matches('\'')
+        .trim_matches('"');
+    let lower = primary.to_ascii_lowercase();
+    (primary.contains("KoPub돋움체") || lower.contains("kopub dotum"))
+        && (primary.contains("Light") || lower.contains("light"))
+}
+
+fn canvas_generic_fallback(font_family: &str) -> &'static str {
+    if is_kopub_dotum_light_face(font_family) {
+        return "'Malgun Gothic','맑은 고딕','Apple SD Gothic Neo','Noto Sans KR ExtraLight','Noto Sans KR','Pretendard','HCR Batang Ext-B','함초롬바탕 확장B','HCR Batang Ext','함초롬바탕 확장','HCR Batang','함초롬바탕','Source Han Serif K Old Hangul',sans-serif";
+    }
+    super::generic_fallback(font_family)
+}
+
+fn canvas_font_family(font_family: &str) -> String {
+    if font_family.is_empty() {
+        "sans-serif".to_string()
+    } else {
+        let fallback = canvas_generic_fallback(font_family);
+        format!("\"{}\", {}", font_family, fallback)
+    }
+}
+
+fn canvas_css_font_weight(style: &TextStyle) -> Option<&'static str> {
+    if !style.bold && is_kopub_dotum_light_face(&style.font_family) {
+        None
+    } else {
+        style.css_font_weight()
+    }
+}
 use super::composer::{
     decode_pua_overlap_number, expand_pua_render_text, pua_to_display_text, CharOverlapInfo,
 };
 use super::form_caption::display_form_caption;
 #[cfg(target_arch = "wasm32")]
-use super::layout::{compute_char_positions, split_into_clusters};
+use super::layout::{compute_char_positions, font_family_has_metrics, split_into_clusters};
 use crate::model::control::FormType;
 
 // 이미지 캐시: data 해시 → HtmlImageElement
@@ -75,6 +112,68 @@ use crate::model::control::FormType;
 thread_local! {
     static IMAGE_CACHE: std::cell::RefCell<std::collections::HashMap<u64, HtmlImageElement>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+// [Task: 임베디드 그림 첫-렌더 페인트] 동기 디코드 캔버스 캐시.
+//
+// 기존 draw_image 는 HtmlImageElement.set_src(data URL) 로 이미지를 비동기
+// 로드하므로, 페이지를 한 번만 renderPageToCanvas 하는 브라우저 뷰어에서는
+// img.complete()==false 라 첫 렌더에 그림이 그려지지 않는다 (재렌더가 없어
+// 영영 빈 칸). PNG/JPEG/BMP 는 image 크레이트로 Rust 측에서 즉시 디코드해
+// 오프스크린 HtmlCanvasElement 에 put_image_data 한 뒤, drawImage(canvas)
+// 로 첫 렌더에 동기 페인트한다. 캐시 값 None = 디코드 불가(WMF/SVG 등) →
+// 기존 HtmlImageElement 비동기 경로로 폴백.
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static DECODED_CANVAS_CACHE: std::cell::RefCell<
+        std::collections::HashMap<u64, Option<HtmlCanvasElement>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// 이미지 바이트를 RGBA 로 디코드해 오프스크린 캔버스로 만든다 (동기).
+///
+/// image 크레이트가 디코드 가능한 포맷(PNG/JPEG/BMP/TIFF)만 처리. 실패하면
+/// None — 호출부는 기존 HtmlImageElement 비동기 경로로 폴백한다.
+#[cfg(target_arch = "wasm32")]
+fn decode_image_to_canvas(data: &[u8]) -> Option<HtmlCanvasElement> {
+    let dynimg = image::load_from_memory(data).ok()?;
+    let rgba = dynimg.to_rgba8();
+    let (iw, ih) = (rgba.width(), rgba.height());
+    if iw == 0 || ih == 0 {
+        return None;
+    }
+    let buf = rgba.into_raw();
+    let image_data =
+        web_sys::ImageData::new_with_u8_clamped_array_and_sh(wasm_bindgen::Clamped(&buf), iw, ih)
+            .ok()?;
+
+    let document = web_sys::window()?.document()?;
+    let canvas: HtmlCanvasElement = document
+        .create_element("canvas")
+        .ok()?
+        .dyn_into::<HtmlCanvasElement>()
+        .ok()?;
+    canvas.set_width(iw);
+    canvas.set_height(ih);
+    let ctx = canvas
+        .get_context("2d")
+        .ok()??
+        .dyn_into::<CanvasRenderingContext2d>()
+        .ok()?;
+    ctx.put_image_data(&image_data, 0.0, 0.0).ok()?;
+    Some(canvas)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn normalize_browser_image_bytes(data: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    if crate::renderer::image_resolver::detect_image_mime_type(data) == "image/jpeg" {
+        if let Some(png) = crate::renderer::image_resolver::grayscale_jpeg_bytes_to_png_bytes(data)
+        {
+            return std::borrow::Cow::Owned(png);
+        }
+    }
+
+    std::borrow::Cow::Borrowed(data)
 }
 
 /// 빠른 해시 (FNV-1a 64비트)
@@ -103,6 +202,11 @@ fn detect_image_mime_type(data: &[u8]) -> &'static str {
         "image/x-icon"
     } else if data.len() >= 2 && &data[0..2] == b"BM" {
         "image/bmp"
+    } else if data.len() >= 4
+        && (data.starts_with(&[0x49, 0x49, 0x2A, 0x00])
+            || data.starts_with(&[0x4D, 0x4D, 0x00, 0x2A]))
+    {
+        "image/tiff"
     } else if data.len() >= 4
         && (data.starts_with(&[0xD7, 0xCD, 0xC6, 0x9A])
             || data.starts_with(&[0x01, 0x00, 0x09, 0x00]))
@@ -645,19 +749,16 @@ impl WebCanvasRenderer {
         } else if run.rotation != 0.0 {
             let cx = bbox.x + bbox.width / 2.0;
             let cy = bbox.y + bbox.height / 2.0;
-            let font_weight = if run.style.bold { "bold " } else { "" };
+            let font_weight = canvas_css_font_weight(&run.style)
+                .map(|weight| format!("{} ", weight))
+                .unwrap_or_default();
             let font_style_str = if run.style.italic { "italic " } else { "" };
             let font_size = if run.style.font_size > 0.0 {
                 run.style.font_size
             } else {
                 12.0
             };
-            let font_family = if run.style.font_family.is_empty() {
-                "sans-serif".to_string()
-            } else {
-                let fallback = super::generic_fallback(&run.style.font_family);
-                format!("\"{}\" , {}", run.style.font_family, fallback)
-            };
+            let font_family = canvas_font_family(&run.style.font_family);
             let font = format!(
                 "{}{}{:.3}px {}",
                 font_style_str, font_weight, font_size, font_family
@@ -2023,7 +2124,9 @@ impl Renderer for WebCanvasRenderer {
         let text = &expand_pua_old_hangul_canvas(text);
 
         // 글꼴 설정
-        let font_weight = if style.bold { "bold " } else { "" };
+        let font_weight = canvas_css_font_weight(style)
+            .map(|weight| format!("{} ", weight))
+            .unwrap_or_default();
         let font_style = if style.italic { "italic " } else { "" };
         let base_font_size = if style.font_size > 0.0 {
             style.font_size
@@ -2040,12 +2143,7 @@ impl Renderer for WebCanvasRenderer {
             (base_font_size, y)
         };
 
-        let font_family = if style.font_family.is_empty() {
-            "sans-serif".to_string()
-        } else {
-            let fallback = super::generic_fallback(&style.font_family);
-            format!("\"{}\", {}", style.font_family, fallback)
-        };
+        let font_family = canvas_font_family(&style.font_family);
 
         let font = format!(
             "{}{}{:.3}px {}",
@@ -2056,6 +2154,15 @@ impl Renderer for WebCanvasRenderer {
         // 장평 적용
         let ratio = if style.ratio > 0.0 { style.ratio } else { 1.0 };
         let has_ratio = (ratio - 1.0).abs() > 0.01;
+
+        // [치환 폰트 글리프 왜곡 방지] 요청 폰트가 내장 메트릭 DB 에 없으면
+        // (= 브라우저가 다른 폰트로 치환) char_positions 의 advance 는 실제
+        // 글리프 폭이 아닌 휴리스틱 폴백(0.5em 등)이다. 이 경우 ASCII 글리프를
+        // advance 에 맞춰 글리프별 가로 스케일(pin_ascii_advance)하면 치환 폰트의
+        // 좁은 글리프(l/i/t)가 과도하게 늘어난다. 치환 폰트에서는 글리프를
+        // 자연 advance 그대로 그리고, run 내 누적 x 도 측정 폭으로 재산출한다.
+        let font_substituted =
+            !font_family_has_metrics(&style.font_family, style.bold, style.italic);
 
         // 클러스터 분할
         let clusters = split_into_clusters(text);
@@ -2179,10 +2286,13 @@ impl Renderer for WebCanvasRenderer {
                 );
                 if needs_font_fallback {
                     self.ctx.save();
+                    let fallback_weight = canvas_css_font_weight(style)
+                        .map(|weight| format!("{weight} "))
+                        .unwrap_or_default();
                     let fallback_font = format!(
                         "{}{}{:.3}px 'Malgun Gothic','맑은 고딕',sans-serif",
                         if style.italic { "italic " } else { "" },
-                        if style.bold { "bold " } else { "" },
+                        fallback_weight,
                         font_size
                     );
                     self.ctx.set_font(&fallback_font);
@@ -2211,9 +2321,16 @@ impl Renderer for WebCanvasRenderer {
                             0.0
                         }
                     };
-                    let pin_ascii_advance =
-                        cluster_str.chars().any(|ch| ch.is_ascii_alphanumeric());
-                    let fit_scale = if cluster_advance > 0.0 {
+                    let is_ascii_alnum = cluster_str.chars().any(|ch| ch.is_ascii_alphanumeric());
+                    // [치환 폰트] ASCII 글리프를 휴리스틱 advance 에 맞춰 늘이는
+                    // pin_ascii_advance 를 끈다. char_positions 의 advance 가 실제
+                    // 글리프 폭이 아니라 0.5em 폴백이므로, 좁은 글리프(l/i/t)가
+                    // 2배까지 늘어나 왜곡되기 때문이다.
+                    let pin_ascii_advance = !font_substituted && is_ascii_alnum;
+                    // 치환 폰트의 ASCII 는 자연 폭 그대로 그린다 — 늘이지도(pin),
+                    // 줄이지도(overflow shrink) 않아야 l/i/t 와 m/w 가 일관된다.
+                    let skip_fit = font_substituted && is_ascii_alnum;
+                    let fit_scale = if cluster_advance > 0.0 && !skip_fit {
                         self.ctx
                             .measure_text(cluster_str)
                             .ok()
@@ -2539,9 +2656,36 @@ impl Renderer for WebCanvasRenderer {
     }
 
     fn draw_image(&mut self, data: &[u8], x: f64, y: f64, w: f64, h: f64) {
+        let render_data = normalize_browser_image_bytes(data);
+        let data = render_data.as_ref();
         let key = hash_bytes(data);
 
-        // 캐시에서 이미 로드된 이미지를 찾는다
+        // [동기 페인트] PNG/JPEG/BMP 는 image 크레이트로 즉시 디코드한 오프스크린
+        // 캔버스를 drawImage 로 첫 렌더에 그린다 (비동기 HtmlImageElement 가
+        // 첫 렌더에 빈 칸이 되는 문제 회피). drawImage(canvas) 는 ctx 변환을
+        // 존중하고 (x,y,w,h) 로 스케일한다.
+        let decoded = DECODED_CANVAS_CACHE.with(|cache| {
+            let mut c = cache.borrow_mut();
+            if let Some(slot) = c.get(&key) {
+                return slot.clone();
+            }
+            // 캐시 크기 제한 (최대 200개)
+            if c.len() > 200 {
+                c.clear();
+            }
+            let canvas = decode_image_to_canvas(data);
+            c.insert(key, canvas.clone());
+            canvas
+        });
+        if let Some(canvas) = decoded {
+            let _ = self
+                .ctx
+                .draw_image_with_html_canvas_element_and_dw_and_dh(&canvas, x, y, w, h);
+            return;
+        }
+
+        // 캐시에서 이미 로드된 이미지를 찾는다 (image 크레이트 미지원 포맷:
+        // WMF/SVG/PCX 등 → HtmlImageElement 비동기 경로)
         let cached = IMAGE_CACHE.with(|cache| {
             let c = cache.borrow();
             c.get(&key).cloned()
@@ -2560,7 +2704,7 @@ impl Renderer for WebCanvasRenderer {
         let mime_type = detect_image_mime_type(data);
 
         // WMF → SVG 변환 (브라우저는 WMF를 렌더링할 수 없으므로 SVG로 변환)
-        // PCX → PNG 변환 (브라우저는 PCX 포맷을 native 렌더링하지 못함, Task #514)
+        // PCX/TIFF → PNG 변환 (브라우저는 두 포맷을 native 렌더링하지 못함)
         let (render_data, render_mime): (std::borrow::Cow<[u8]>, &str) =
             if mime_type == "image/x-wmf" {
                 match crate::renderer::svg::convert_wmf_to_svg(data) {
@@ -2569,6 +2713,16 @@ impl Renderer for WebCanvasRenderer {
                 }
             } else if mime_type == "image/x-pcx" {
                 match crate::renderer::image_resolver::pcx_bytes_to_png_bytes(data) {
+                    Some(png_bytes) => (std::borrow::Cow::Owned(png_bytes), "image/png"),
+                    None => (std::borrow::Cow::Borrowed(data), mime_type),
+                }
+            } else if mime_type == "image/tiff" {
+                match crate::renderer::image_resolver::tiff_bytes_to_png_bytes(data) {
+                    Some(png_bytes) => (std::borrow::Cow::Owned(png_bytes), "image/png"),
+                    None => (std::borrow::Cow::Borrowed(data), mime_type),
+                }
+            } else if mime_type == "image/jpeg" {
+                match crate::renderer::image_resolver::grayscale_jpeg_bytes_to_png_bytes(data) {
                     Some(png_bytes) => (std::borrow::Cow::Owned(png_bytes), "image/png"),
                     None => (std::borrow::Cow::Borrowed(data), mime_type),
                 }
@@ -2630,7 +2784,32 @@ impl WebCanvasRenderer {
         dw: f64,
         dh: f64,
     ) {
+        let render_data = normalize_browser_image_bytes(data);
+        let data = render_data.as_ref();
         let key = hash_bytes(data);
+
+        // [동기 페인트] PNG/JPEG/BMP 는 디코드된 오프스크린 캔버스로 첫 렌더에
+        // crop 적용. (draw_image 와 동일 캐시 공유)
+        let decoded = DECODED_CANVAS_CACHE.with(|cache| {
+            let mut c = cache.borrow_mut();
+            if let Some(slot) = c.get(&key) {
+                return slot.clone();
+            }
+            if c.len() > 200 {
+                c.clear();
+            }
+            let canvas = decode_image_to_canvas(data);
+            c.insert(key, canvas.clone());
+            canvas
+        });
+        if let Some(canvas) = decoded {
+            let _ = self
+                .ctx
+                .draw_image_with_html_canvas_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
+                    &canvas, sx, sy, sw, sh, dx, dy, dw, dh,
+                );
+            return;
+        }
 
         let cached = IMAGE_CACHE.with(|cache| {
             let c = cache.borrow();
@@ -2820,13 +2999,10 @@ impl WebCanvasRenderer {
             glyph_color.clone()
         };
 
-        let font_family = if style.font_family.is_empty() {
-            "sans-serif".to_string()
-        } else {
-            let fallback = super::generic_fallback(&style.font_family);
-            format!("\"{}\" , {}", style.font_family, fallback)
-        };
-        let font_weight = if style.bold { "bold " } else { "" };
+        let font_family = canvas_font_family(&style.font_family);
+        let font_weight = canvas_css_font_weight(style)
+            .map(|weight| format!("{} ", weight))
+            .unwrap_or_default();
         let font_style_str = if style.italic { "italic " } else { "" };
         let font = format!(
             "{}{}{:.3}px {}",
@@ -2986,12 +3162,7 @@ impl WebCanvasRenderer {
             glyph_color.clone()
         };
 
-        let font_family = if style.font_family.is_empty() {
-            "sans-serif".to_string()
-        } else {
-            let fallback = super::generic_fallback(&style.font_family);
-            format!("\"{}\" , {}", style.font_family, fallback)
-        };
+        let font_family = canvas_font_family(&style.font_family);
 
         let cx = bbox_x + box_size / 2.0;
         let cy = bbox_y + bbox_h - box_size / 2.0;
@@ -3031,7 +3202,9 @@ impl WebCanvasRenderer {
             1.0
         };
 
-        let font_weight = if style.bold { "bold " } else { "" };
+        let font_weight = canvas_css_font_weight(style)
+            .map(|weight| format!("{} ", weight))
+            .unwrap_or_default();
         let font_style_str = if style.italic { "italic " } else { "" };
         let font = format!(
             "{}{}{:.3}px {}",
@@ -3258,6 +3431,7 @@ impl WebCanvasRenderer {
                         bbox.y + bbox.height - img_height,
                     ),
                     ImageFillMode::TileAll
+                    | ImageFillMode::Total
                     | ImageFillMode::TileHorzTop
                     | ImageFillMode::TileHorzBottom
                     | ImageFillMode::TileVertLeft
@@ -3272,7 +3446,7 @@ impl WebCanvasRenderer {
                 self.ctx.clip();
 
                 match mode {
-                    ImageFillMode::TileAll => {
+                    ImageFillMode::TileAll | ImageFillMode::Total => {
                         // 바둑판식으로-모두: 전체 타일링
                         let mut ty = bbox.y;
                         while ty < bbox.y + bbox.height {
