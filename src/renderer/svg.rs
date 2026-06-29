@@ -10,7 +10,7 @@ use super::form_caption::display_form_caption;
 pub(crate) use super::image_resolver::{
     bmp_bytes_to_png_bytes, detect_image_mime_type, pcx_bytes_to_png_bytes,
     real_picture_watermark_bytes_to_hancom_tone_png_bytes,
-    real_picture_watermark_fill_bytes_to_hancom_tone_png_bytes,
+    real_picture_watermark_fill_bytes_to_hancom_tone_png_bytes, tiff_bytes_to_png_bytes,
     watermark_jpeg_bytes_to_hancom_baked_png_bytes,
 };
 use super::pua_oldhangul::map_pua_old_hangul;
@@ -260,11 +260,18 @@ impl SvgRenderer {
             RenderNodeType::PageBackground(bg) => {
                 // 배경색 먼저 (이미지가 투명 부분을 가질 수 있으므로)
                 if let Some(color) = bg.background_color {
-                    let color_str = color_to_svg(color);
-                    self.output.push_str(&format!(
-                        "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" fill=\"{}\"/>\n",
-                        node.bbox.x, node.bbox.y, node.bbox.width, node.bbox.height, color_str,
-                    ));
+                    let is_default_white_page_fill = (color & 0x00ff_ffff) == 0x00ff_ffff
+                        && node.bbox.x.abs() < 0.001
+                        && node.bbox.y.abs() < 0.001
+                        && (node.bbox.width - self.width).abs() < 0.001
+                        && (node.bbox.height - self.height).abs() < 0.001;
+                    if !is_default_white_page_fill {
+                        let color_str = color_to_svg(color);
+                        self.output.push_str(&format!(
+                            "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" fill=\"{}\"/>\n",
+                            node.bbox.x, node.bbox.y, node.bbox.width, node.bbox.height, color_str,
+                        ));
+                    }
                 }
                 // 그라데이션 (배경색 위에 덮음)
                 if let Some(grad) = &bg.gradient {
@@ -322,10 +329,8 @@ impl SvgRenderer {
                     };
                     let mut attrs = format!("font-family=\"{}\" font-size=\"{}\" fill=\"{}\" text-anchor=\"middle\" dominant-baseline=\"central\"",
                         escape_xml(&font_family), font_size, color);
-                    if run.style.is_visually_bold() {
-                        attrs.push_str(" font-weight=\"bold\"");
-                    } else if run.style.is_medium_weight() {
-                        attrs.push_str(" font-weight=\"500\"");
+                    if let Some(weight) = run.style.css_font_weight() {
+                        attrs.push_str(&format!(" font-weight=\"{}\"", weight));
                     }
                     if run.style.italic {
                         attrs.push_str(" font-style=\"italic\"");
@@ -464,7 +469,13 @@ impl SvgRenderer {
             }
             RenderNodeType::Path(path) => {
                 self.open_shape_transform(&path.transform, &node.bbox);
-                self.draw_path_with_gradient(&path.commands, &path.style, path.gradient.as_deref());
+                let connector_line = path.line_style.as_ref().zip(path.connector_endpoints);
+                self.draw_path_with_gradient_and_line_style(
+                    &path.commands,
+                    &path.style,
+                    path.gradient.as_deref(),
+                    connector_line,
+                );
             }
             RenderNodeType::Equation(eq) => {
                 // 수식 SVG 조각을 bbox 위치에 배치
@@ -1219,6 +1230,16 @@ impl SvgRenderer {
         style: &ShapeStyle,
         gradient: Option<&GradientFillInfo>,
     ) {
+        self.draw_path_with_gradient_and_line_style(commands, style, gradient, None);
+    }
+
+    fn draw_path_with_gradient_and_line_style(
+        &mut self,
+        commands: &[PathCommand],
+        style: &ShapeStyle,
+        gradient: Option<&GradientFillInfo>,
+        connector_line: Option<(&LineStyle, (f64, f64, f64, f64))>,
+    ) {
         let mut d = String::new();
         for cmd in commands {
             match cmd {
@@ -1259,6 +1280,35 @@ impl SvgRenderer {
                 StrokeDash::DashDot => attrs.push_str(" stroke-dasharray=\"6 3 2 3\""),
                 StrokeDash::DashDotDot => attrs.push_str(" stroke-dasharray=\"6 3 2 3 2 3\""),
                 _ => {}
+            }
+        }
+
+        if let Some((line_style, (x1, y1, x2, y2))) = connector_line {
+            let line_len = ((x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1))
+                .sqrt()
+                .max(1.0);
+            let color = color_to_svg(line_style.color);
+            if line_style.start_arrow != super::ArrowStyle::None {
+                let marker_id = self.ensure_arrow_marker(
+                    &color,
+                    line_style.width,
+                    line_len,
+                    &line_style.start_arrow,
+                    line_style.start_arrow_size,
+                    true,
+                );
+                attrs.push_str(&format!(" marker-start=\"url(#{})\"", marker_id));
+            }
+            if line_style.end_arrow != super::ArrowStyle::None {
+                let marker_id = self.ensure_arrow_marker(
+                    &color,
+                    line_style.width,
+                    line_len,
+                    &line_style.end_arrow,
+                    line_style.end_arrow_size,
+                    false,
+                );
+                attrs.push_str(&format!(" marker-end=\"url(#{})\"", marker_id));
             }
         }
 
@@ -1356,7 +1406,7 @@ impl SvgRenderer {
         // 놓쳐 opacity 가 빠지는 회귀를 냈다.
         let is_watermark_image = img.is_watermark();
         let detected_mime = detect_image_mime_type(&img.data);
-        // BMP/PCX → PNG 재인코딩 (브라우저 호환성과 PCX white transparency 정합)
+        // BMP/PCX/TIFF → PNG 재인코딩 (브라우저 호환성과 PCX white transparency 정합)
         let (render_bytes, render_mime): (std::borrow::Cow<[u8]>, &str) =
             if preserve_color_watermark {
                 match real_picture_watermark_bytes_to_hancom_tone_png_bytes(&img.data) {
@@ -1376,6 +1426,14 @@ impl SvgRenderer {
                 }
             } else if detected_mime == "image/x-pcx" {
                 match pcx_bytes_to_png_bytes(&img.data) {
+                    Some(png) => (std::borrow::Cow::Owned(png), "image/png"),
+                    None => (
+                        std::borrow::Cow::Borrowed(img.data.as_slice()),
+                        detected_mime,
+                    ),
+                }
+            } else if detected_mime == "image/tiff" {
+                match tiff_bytes_to_png_bytes(&img.data) {
                     Some(png) => (std::borrow::Cow::Owned(png), "image/png"),
                     None => (
                         std::borrow::Cow::Borrowed(img.data.as_slice()),
@@ -1427,7 +1485,7 @@ impl SvgRenderer {
                     bbox.x, bbox.y, bbox.width, bbox.height, data_uri,
                 ));
             }
-            ImageFillMode::TileAll => {
+            ImageFillMode::TileAll | ImageFillMode::Total => {
                 self.render_tiled_image(&render_bytes, &data_uri, bbox, true, true, None);
             }
             ImageFillMode::TileHorzTop | ImageFillMode::TileHorzBottom => {
@@ -1491,7 +1549,7 @@ impl SvgRenderer {
 
         // WMF → SVG 변환 (브라우저는 WMF를 렌더링할 수 없으므로 SVG로 변환)
         // BMP → PNG 변환 (브라우저는 SVG <image> 내부의 data:image/bmp 미지원)
-        // PCX → PNG 변환 (브라우저는 PCX 포맷을 native 렌더링하지 못함, Task #514)
+        // PCX/TIFF → PNG 변환 (브라우저는 두 포맷을 native 렌더링하지 못함)
         let (render_data, render_mime, baked_watermark): (std::borrow::Cow<[u8]>, &str, bool) =
             if preserve_color_watermark {
                 match real_picture_watermark_fill_bytes_to_hancom_tone_png_bytes(data) {
@@ -1510,6 +1568,11 @@ impl SvgRenderer {
                 }
             } else if mime_type == "image/x-pcx" {
                 match pcx_bytes_to_png_bytes(data) {
+                    Some(png_bytes) => (std::borrow::Cow::Owned(png_bytes), "image/png", false),
+                    None => (std::borrow::Cow::Borrowed(data), mime_type, false),
+                }
+            } else if mime_type == "image/tiff" {
+                match tiff_bytes_to_png_bytes(data) {
                     Some(png_bytes) => (std::borrow::Cow::Owned(png_bytes), "image/png", false),
                     None => (std::borrow::Cow::Borrowed(data), mime_type, false),
                 }
@@ -1618,7 +1681,7 @@ impl SvgRenderer {
                     ));
                 }
             }
-            ImageFillMode::TileAll => {
+            ImageFillMode::TileAll | ImageFillMode::Total => {
                 // 바둑판식으로-모두: 원래 크기로 전체 타일링
                 self.render_tiled_image(
                     &render_data,
@@ -1973,10 +2036,8 @@ impl SvgRenderer {
             escape_xml(&font_family_str),
             inner_font_size
         );
-        if style.is_visually_bold() {
-            font_attrs.push_str(" font-weight=\"bold\"");
-        } else if style.is_medium_weight() {
-            font_attrs.push_str(" font-weight=\"500\"");
+        if let Some(weight) = style.css_font_weight() {
+            font_attrs.push_str(&format!(" font-weight=\"{}\"", weight));
         }
         if style.italic {
             font_attrs.push_str(" font-style=\"italic\"");
@@ -2117,10 +2178,8 @@ impl SvgRenderer {
             escape_xml(&font_family_str),
             inner_font_size
         );
-        if style.is_visually_bold() {
-            font_attrs.push_str(" font-weight=\"bold\"");
-        } else if style.is_medium_weight() {
-            font_attrs.push_str(" font-weight=\"500\"");
+        if let Some(weight) = style.css_font_weight() {
+            font_attrs.push_str(&format!(" font-weight=\"{}\"", weight));
         }
         if style.italic {
             font_attrs.push_str(" font-style=\"italic\"");
@@ -2630,6 +2689,13 @@ impl Renderer for SvgRenderer {
             width, height, width, height,
         ));
         self.defs_insert_pos = self.output.len();
+        // HWP/PDF pages are opaque white by default. Some pages have no explicit
+        // PageBackground node; without this, SVG-to-PNG tools composite the
+        // transparent page against black and produce false visual diffs.
+        self.output.push_str(&format!(
+            "<rect x=\"0\" y=\"0\" width=\"{}\" height=\"{}\" fill=\"#ffffff\"/>\n",
+            width, height
+        ));
     }
 
     fn end_page(&mut self) {
@@ -2688,10 +2754,8 @@ impl Renderer for SvgRenderer {
             escape_xml(&font_family),
             font_size,
         );
-        if style.is_visually_bold() {
-            base_attrs.push_str(" font-weight=\"bold\"");
-        } else if style.is_medium_weight() {
-            base_attrs.push_str(" font-weight=\"500\"");
+        if let Some(weight) = style.css_font_weight() {
+            base_attrs.push_str(&format!(" font-weight=\"{}\"", weight));
         }
         if style.italic {
             base_attrs.push_str(" font-style=\"italic\"");
@@ -3185,6 +3249,11 @@ impl Renderer for SvgRenderer {
                 }
             } else if mime_type == "image/x-pcx" {
                 match pcx_bytes_to_png_bytes(data) {
+                    Some(png_bytes) => (std::borrow::Cow::Owned(png_bytes), "image/png"),
+                    None => (std::borrow::Cow::Borrowed(data), mime_type),
+                }
+            } else if mime_type == "image/tiff" {
+                match tiff_bytes_to_png_bytes(data) {
                     Some(png_bytes) => (std::borrow::Cow::Owned(png_bytes), "image/png"),
                     None => (std::borrow::Cow::Borrowed(data), mime_type),
                 }
