@@ -575,6 +575,50 @@ sha256 canonical-slow-drive-pid7444.jsonl
   8054a86db0a1dfb14914491390009dda34069fa3a6efde544f4f686ede2fc4c1
 ```
 
+### U+2000 ordinary-endpoint semantics
+
+The same restored paragraph was used to sweep an explicitly open Unicode-space
+case. U+2000 EN QUAD was inserted at source position 211, between the existing
+spaces after `IP,` and the following Korean text. The target descriptor oracle
+contained U+2000, so this is a document edit rather than a successful-but-
+ignored `SendInput` call.
+
+The complete interval transition was:
+
+```text
+original: [0,54) [54,107) [107,159) [159,211) [211,261) [261,271)
+U+2000:   [0,54) [54,107) [107,159) [159,212) [212,262) [262,272)
+restored: [0,54) [54,107) [107,159) [159,211) [211,261) [261,271)
+```
+
+U+2000 is therefore owned by the preceding interval: insertion changes
+`[159,211)` to `[159,212)`, and the successor interval begins at 212. The
+formatter exposed the inserted run with U+2000 at its boundary and assigned
+the separator advance `1300` in this style. `FUN_101dd900` selected endpoint
+212 directly; `FUN_101dd070` did not run. This dynamically confirms U+2000 as
+an ordinary-scan stopping unit whose source position belongs to the completed
+line in this context.
+
+The attempted U+2007, U+200B, and U+3000 cases remain open. Their driver calls
+returned success, but no target descriptor contained those code points before
+restoration, so they are explicitly rejected as semantic evidence. A final
+redraw verified the original text and all six original intervals after the
+sweep.
+
+```text
+~/Documents/hancom/captures/20260712-hysnmj-line-closure/raw/
+  canonical-unicode-space-sweep15-pid7444.jsonl
+  canonical-unicode-space-driver15-pid7444.jsonl
+  canonical-post-sweep15-verify-pid7444.jsonl
+
+sha256 canonical-unicode-space-sweep15-pid7444.jsonl
+  15991540ef60ef4d561a9c2d742e7c29030281139b1f7db4d907b1db34fc688c
+sha256 canonical-unicode-space-driver15-pid7444.jsonl
+  e7a32e84ca6920b1b41637d86f51277c1ed3a4e91e211a2fd230d86479ce270a
+sha256 canonical-post-sweep15-verify-pid7444.jsonl
+  906c08e2655b16d00887f3ded9d51849254e716278688654a68cb689c9c7b179
+```
+
 ## rhwp Representation Requirement
 
 The engine needs one canonical layout state for every paragraph context,

@@ -813,8 +813,9 @@ Statically and format-semantically proved:
 
 Statically identified but not yet fully parameterized:
 
-- special handling for CR, U+001F, and Unicode-space variants not yet swept
-  dynamically;
+- special handling for CR, U+001F, U+2001..U+200B, and U+3000 remains to be
+  swept dynamically; U+2000 is now confirmed as an ordinary-scan stopping unit
+  owned by the preceding line in one mixed Korean/Latin paragraph context;
 - matched header/footer and footnote/endnote control anchors in endpoint
   resolution;
 - descriptor emission after wrapper finalization.

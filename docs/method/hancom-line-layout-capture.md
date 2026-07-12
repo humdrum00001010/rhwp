@@ -220,3 +220,9 @@ and record its UTF-16 text. A selector call without that ownership field proves
 the code path but cannot be assigned to a named fixture paragraph. Target input
 is valid only when the paragraph-specific descriptor oracle records the changed
 text and intervals.
+
+For invisible Unicode separator sweeps, a successful `SendInput` return is
+especially weak evidence. Require the separator's exact code point in
+`paragraphText` before classifying its endpoint behavior. In the HWP3-converted
+fixture, U+2000 satisfied this requirement; U+2007, U+200B, and U+3000 did not
+emit a target descriptor containing the inserted code point and remained open.
