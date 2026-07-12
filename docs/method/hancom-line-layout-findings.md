@@ -517,6 +517,64 @@ for the `run_class == 0x20` branch. The accepted evidence is the style change
 performed by Hancom itself, which produced flags `0x1a0` and dynamically
 invoked `FUN_10657c80` in the stable native document.
 
+### HWP3-converted mixed-script closure
+
+The converted `hwp3-sample16-hwp5-2022.hwp` fixture contains a long paragraph
+mixing Korean, Latin product names, punctuation, and spaces. A reversible GUI
+edit inserted `x` immediately before `S/W`, waited for the inserted state to
+finish formatting, then deleted it and waited for the restored state.
+
+The descriptor sequence was:
+
+```text
+original: [0,54) [54,107) [107,159) [159,211)
+inserted: [0,54) [54,107) [107,160) [160,212)
+restored: [0,54) [54,107) [107,159) [159,211)
+```
+
+The first two endpoints were stable because the insertion occurred after
+source position 107. Every affected downstream endpoint advanced by exactly
+one source unit and returned exactly after deletion. `FUN_101dd900` finalized
+the same transition:
+
+```text
+state       line starts        selected endpoints
+original    0,54,107,159,211   54,107,159,211,261
+inserted    0,54,107,160,212   54,107,160,212,262
+restored    0,54,107,159,211   54,107,159,211,261
+```
+
+The terminal wrapper call selects two source units beyond the last descriptor
+shown above because the capture excerpt stops before the remaining paragraph
+descriptors; it is retained as wrapper evidence, not presented as a visible
+line boundary in isolation.
+
+No `FUN_101dd070` event occurred during either state. This establishes that
+the mixed Korean/Latin edit remained on `FUN_101dd900`'s ordinary endpoint
+path: the presence of Latin text does not itself select the specialized word
+candidate branch. The formatter's run for the affected inserted line began
+with `xS/W...`; its first advances were `672, 684, 788, 1296`, while the
+restored run began with `S/W...` and `684, 788, 1296`. Endpoint movement
+therefore followed the changed cumulative source sequence without changing
+the surrounding flow-frame width or descriptor ownership.
+
+Hancom deferred this document's reflow for several seconds. A 1.5-second
+insert/delete driver produced only the final restored descriptors and is not
+valid reversible evidence. The accepted driver held each state for 10 seconds
+and required descriptors containing `xS/W` before deletion. The preserved raw
+records are:
+
+```text
+~/Documents/hancom/captures/20260712-hysnmj-line-closure/raw/
+  canonical-slow-reversible-pid7444.jsonl
+  canonical-slow-drive-pid7444.jsonl
+
+sha256 canonical-slow-reversible-pid7444.jsonl
+  e0f6b2e1645f184dc089504064653fa0b1fc196188c8e485124f17f648139a00
+sha256 canonical-slow-drive-pid7444.jsonl
+  8054a86db0a1dfb14914491390009dda34069fa3a6efde544f4f686ede2fc4c1
+```
+
 ## rhwp Representation Requirement
 
 The engine needs one canonical layout state for every paragraph context,

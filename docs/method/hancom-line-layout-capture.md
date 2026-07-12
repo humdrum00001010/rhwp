@@ -72,6 +72,15 @@ Do not infer an intermediate state from elapsed time. An edit is acknowledged
 only after the expected paragraph identity and source length appear in the
 descriptor stream.
 
+Some large converted documents defer the visible formatter pass for several
+seconds after `SendInput` succeeds. A fixed short sleep can therefore collapse
+an insert/delete pair into one final reflow and hide the intermediate state.
+When a message-driven closed loop is not available, hold each state long
+enough to observe a descriptor containing the inserted marker before sending
+the inverse edit. The accepted HWP3-converted mixed-script capture used 10
+seconds per state; its earlier 1.5-second attempt was rejected because only the
+restored paragraph was emitted.
+
 ## Current Descriptor Probe
 
 The verified table-cell probe is at `HwpApp.dll+0x189ab5`.
