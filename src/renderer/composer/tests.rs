@@ -229,14 +229,26 @@ fn test_char_overlap_multi_component_is_single_advance() {
 /// LineSeg 없는 텍스트 문단
 #[test]
 fn test_compose_no_line_segs() {
-    let para = Paragraph {
+    // rhwp 는 로드 시 모든 문단의 line_segs 를 line-break 엔진으로 **항상** 계산하므로
+    // compose_paragraph 가 빈 line_segs 를 마주치는 일은 프로덕션에 없다. compose 는
+    // 저장 seg 부재를 레이아웃 소스로 합성하지 않으므로(옛 CHARS_PER_LINE 폴백 삭제),
+    // 이 테스트도 프로덕션과 동일하게 reflow → compose 순서를 검증한다.
+    let mut para = Paragraph {
         text: "텍스트만 있음".to_string(),
+        char_offsets: vec![0, 1, 2, 3, 4, 5, 6],
         char_shapes: vec![CharShapeRef {
             start_pos: 0,
             char_shape_id: 7,
         }],
         ..Default::default()
     };
+
+    // 프로덕션 로드 경로와 동일하게 먼저 reflow 로 line_segs 를 채운다.
+    let styles = crate::renderer::style_resolver::resolve_styles(
+        &crate::model::document::DocInfo::default(),
+        96.0,
+    );
+    crate::renderer::composer::reflow_line_segs(&mut para, 600.0, &styles, 96.0);
 
     let composed = compose_paragraph(&para);
     assert_eq!(composed.lines.len(), 1);
