@@ -13,6 +13,7 @@ use crate::model::style::UnderlineType;
 use base64::Engine;
 
 /// HTML 렌더러
+///
 pub struct HtmlRenderer {
     /// HTML 출력 버퍼
     output: String,
